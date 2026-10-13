@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // O nome precisa ser IGUAL ao nome do projeto no painel da Cloudflare,
+  // senão o build falha.
+  "name": "auction-analysis",
+
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-10-01",
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    // O app é uma página única: qualquer caminho sem arquivo devolve o index.html.
+    "not_found_handling": "single-page-application",
+    // Só /api/* executa código do Worker. O resto vem direto dos arquivos estáticos.
+    "run_worker_first": ["/api/*"]
+  },
+
+  "observability": { "enabled": true }
+}
