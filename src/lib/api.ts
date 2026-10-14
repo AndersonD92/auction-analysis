@@ -149,8 +149,8 @@ export async function enrichRaw(
 
 export type ScanSource =
   | { kind: 'url'; url: string }
-  | { kind: 'text'; text: string }
-  | { kind: 'file'; mimeType: string; data: string; name: string };
+  | { kind: 'text'; text: string; catalogUrl?: string }
+  | { kind: 'file'; mimeType: string; data: string; name: string; catalogUrl?: string };
 
 function hostName(url: string): string {
   try {
@@ -190,18 +190,21 @@ export async function scanSource(
       if (r.done) break;
     }
     if (raws.length === 0) {
+      const why = warnings.length ? ` Details: ${warnings.slice(0, 2).join(' ')}` : '';
       throw new ApiError(
-        'No lots were found on that page. Some sites load their lots with JavaScript, so try pasting the text or uploading a PDF instead.',
+        `No lots were found on that page.${why} Some sites load their lots with JavaScript or block automatic readers, so try pasting the text or uploading a PDF instead.`,
         'no_lots',
       );
     }
   } else if (source.kind === 'text') {
-    name = 'Pasted lots';
+    catalogUrl = source.catalogUrl ?? '';
+    name = catalogUrl ? `${hostName(catalogUrl)} (pasted)` : 'Pasted lots';
     onProgress?.({ stage: 'reading', done: 0, total: 0, message: 'Reading the pasted text' });
     const r = await post<{ lots: RawLot[]; warnings: string[] }>('/api/extract', { text: source.text }, signal);
     raws = r.lots;
     warnings.push(...r.warnings);
   } else {
+    catalogUrl = source.catalogUrl ?? '';
     name = source.name;
     onProgress?.({ stage: 'reading', done: 0, total: 0, message: 'Reading the file' });
     const r = await post<{ lots: RawLot[]; warnings: string[] }>(
