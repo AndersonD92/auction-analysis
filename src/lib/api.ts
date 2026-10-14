@@ -144,7 +144,7 @@ export async function enrichRaw(
   const warnings: string[] = [];
   const parts = chunk(raws, ENRICH_CHUNK);
   const scanId = `s${Date.now().toString(36)}`;
-  for (let i = 0; i < parts.length; i++) {
+  outer: for (let i = 0; i < parts.length; i++) {
     const doneBefore = i * ENRICH_CHUNK;
     const label = `Researching market prices (${Math.min(raws.length, doneBefore + parts[i].length)} of ${raws.length})`;
     if (i > 0) await sleep(ENRICH_PAUSE_MS, signal);
@@ -164,6 +164,11 @@ export async function enrichRaw(
       } catch (e) {
         // Se a IA não está configurada ou a chave é inválida não adianta tentar os próximos pedaços.
         if (e instanceof ApiError && ['no_key', 'bad_key', 'bad_model', 'aborted'].includes(e.code)) throw e;
+        // Cota diária esgotada: os próximos pedaços falhariam igual. Para aqui e guarda o que já foi feito.
+        if (e instanceof ApiError && e.code === 'quota') {
+          warnings.push(e.message);
+          break outer;
+        }
         // Limite por minuto do Gemini: espera e tenta o mesmo pedaço de novo.
         if (e instanceof ApiError && e.code === 'rate_limit' && attempt < RATE_LIMIT_WAITS_S.length) {
           const wait = RATE_LIMIT_WAITS_S[attempt];
