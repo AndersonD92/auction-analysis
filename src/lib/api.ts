@@ -109,6 +109,30 @@ export function finalizeLots(lots: Lot[], catalogUrl: string, scanId: string, na
   });
 }
 
+/** Pausa que pode ser cancelada junto com o scan. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new ApiError('Cancelled.', 'aborted'));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new ApiError('Cancelled.', 'aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** Espera entre pedaços para não estourar o limite por minuto da chave gratuita do Gemini. */
+export const ENRICH_PAUSE_MS = 4000;
+/** Esperas (em segundos) antes de tentar de novo um pedaço que bateu no limite do Gemini. */
+export const RATE_LIMIT_WAITS_S = [25, 45, 65];
+
 /** Analisa lotes brutos com a IA, em pedaços pequenos para caber no tempo do plano gratuito. */
 export async function enrichRaw(
   raws: RawLot[],
@@ -121,24 +145,43 @@ export async function enrichRaw(
   const parts = chunk(raws, ENRICH_CHUNK);
   const scanId = `s${Date.now().toString(36)}`;
   for (let i = 0; i < parts.length; i++) {
-    onProgress?.({
-      stage: 'analyzing',
-      done: i * ENRICH_CHUNK,
-      total: raws.length,
-      message: `Researching market prices (${Math.min(raws.length, i * ENRICH_CHUNK + parts[i].length)} of ${raws.length})`,
-    });
-    try {
-      const r = await post<{ lots: Lot[]; warnings: string[] }>(
-        '/api/enrich',
-        { lots: parts[i], catalogUrl: ctx.catalogUrl, auctionName: ctx.name },
-        signal,
-      );
-      lots.push(...finalizeLots(r.lots, ctx.catalogUrl, scanId, ctx.name));
-      warnings.push(...r.warnings);
-    } catch (e) {
-      // Se a IA não está configurada ou a chave é inválida não adianta tentar os próximos pedaços.
-      if (e instanceof ApiError && ['no_key', 'bad_key', 'bad_model', 'aborted'].includes(e.code)) throw e;
-      warnings.push(`Lots ${parts[i][0].lotNumber}–${parts[i][parts[i].length - 1].lotNumber} failed: ${e instanceof Error ? e.message : 'unknown error'}`);
+    const doneBefore = i * ENRICH_CHUNK;
+    const label = `Researching market prices (${Math.min(raws.length, doneBefore + parts[i].length)} of ${raws.length})`;
+    if (i > 0) await sleep(ENRICH_PAUSE_MS, signal);
+
+    let attempt = 0;
+    for (;;) {
+      onProgress?.({ stage: 'analyzing', done: doneBefore, total: raws.length, message: label });
+      try {
+        const r = await post<{ lots: Lot[]; warnings: string[] }>(
+          '/api/enrich',
+          { lots: parts[i], catalogUrl: ctx.catalogUrl, auctionName: ctx.name },
+          signal,
+        );
+        lots.push(...finalizeLots(r.lots, ctx.catalogUrl, scanId, ctx.name));
+        warnings.push(...r.warnings);
+        break;
+      } catch (e) {
+        // Se a IA não está configurada ou a chave é inválida não adianta tentar os próximos pedaços.
+        if (e instanceof ApiError && ['no_key', 'bad_key', 'bad_model', 'aborted'].includes(e.code)) throw e;
+        // Limite por minuto do Gemini: espera e tenta o mesmo pedaço de novo.
+        if (e instanceof ApiError && e.code === 'rate_limit' && attempt < RATE_LIMIT_WAITS_S.length) {
+          const wait = RATE_LIMIT_WAITS_S[attempt];
+          attempt += 1;
+          for (let s = wait; s > 0; s--) {
+            onProgress?.({
+              stage: 'analyzing',
+              done: doneBefore,
+              total: raws.length,
+              message: `Gemini asked for a short pause. Trying again in ${s}s (attempt ${attempt} of ${RATE_LIMIT_WAITS_S.length})`,
+            });
+            await sleep(1000, signal);
+          }
+          continue;
+        }
+        warnings.push(`Lots ${parts[i][0].lotNumber}–${parts[i][parts[i].length - 1].lotNumber} failed: ${e instanceof Error ? e.message : 'unknown error'}`);
+        break;
+      }
     }
   }
   if (lots.length === 0 && raws.length > 0) {
