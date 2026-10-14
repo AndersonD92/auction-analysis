@@ -48,6 +48,10 @@ const CONTAINER_SELECTOR = [
 
 const MAX_LOTS_PER_PAGE = 300;
 
+/** Aceita o HTML ou um documento já carregado: carregar o HTML é a parte mais cara, então fazemos uma vez por página. */
+type Doc = string | cheerio.CheerioAPI;
+const load = (d: Doc): cheerio.CheerioAPI => (typeof d === 'string' ? cheerio.load(d) : d);
+
 export function parseMoney(text: string | undefined): number {
   if (!text) return 0;
   const m = text.replace(/,/g, '').match(/\$?\s*(\d+(?:\.\d{1,2})?)/);
@@ -185,8 +189,132 @@ function readLot(
   };
 }
 
-export function parseLots(html: string, pageUrl: string): RawLot[] {
-  const $ = cheerio.load(html);
+/* ---------- leitura ancorada nos links de lote (plataformas sem classes previsíveis) ---------- */
+
+/** /lotInformation/123, /lot/123, ?lid=123, ?itemid=123 ... */
+const LOT_LINK = /(?:lotinformation[/=]|\/lot[/-]|[?&](?:lotid|itemid|lid)=)(\d+)/i;
+const NOISE_LOT = /^\s*(terms of sale|directions|shipping|payment|auction information|notice)/i;
+
+function bidFromText(text: string): number {
+  const high = text.match(/(?:high|current|winning)\s+bid\s*:?\s*(?:USD|US\$|\$)\s*([\d,]+(?:\.\d{1,2})?)/i);
+  if (high) return parseMoney(high[1]);
+  const min = text.match(/(?:minimum|starting|opening)\s+bid\s*:?\s*(?:USD|US\$|\$)?\s*([\d,]+(?:\.\d{1,2})?)/i);
+  if (min) return parseMoney(min[1]);
+  return 0;
+}
+
+/* Acesso direto aos nós do DOM: evita criar objetos do cheerio por lote, que é o que custa CPU. */
+function collectText(n: any, out: string[]): void {
+  if (n.type === 'text') out.push(n.data);
+  else if (n.type === 'tag' && n.name !== 'script' && n.name !== 'style' && n.children) {
+    for (const c of n.children) collectText(c, out);
+  }
+}
+const textOf = (n: any): string => {
+  const out: string[] = [];
+  collectText(n, out);
+  return out.join(' ').replace(/\s+/g, ' ').trim();
+};
+const HEADING = /^h[1-6]$/;
+const inHeading = (n: any): boolean => {
+  for (let p = n.parent, d = 0; p && d < 4; p = p.parent, d++) if (p.type === 'tag' && HEADING.test(p.name)) return true;
+  return false;
+};
+function firstImage(n: any): string {
+  const stack: any[] = [n];
+  while (stack.length) {
+    const cur = stack.shift();
+    if (cur.type === 'tag' && cur.name === 'img') {
+      const a = cur.attribs ?? {};
+      const src = a['data-src'] ?? a['data-original'] ?? a['data-lazy-src'] ?? a.src ?? '';
+      if (src && !/\.(gif|svg)(\?|$)/i.test(src) && !/sprite|spacer|transparent|pixel|progressbar/i.test(src)) return src;
+    }
+    if (cur.children) for (const c of cur.children) if (c.type === 'tag') stack.push(c);
+  }
+  return '';
+}
+
+/**
+ * Plano B quando os seletores de contêiner não acham nada: parte dos links que levam a um lote
+ * e sobe na árvore até o maior bloco que contém só aquele lote. Funciona sem conhecer as classes.
+ */
+export function parseByLotLinks(doc: Doc, pageUrl: string): RawLot[] {
+  const $ = load(doc);
+  const byId = new Map<string, any[]>();
+  for (const a of $('a[href]').toArray() as any[]) {
+    const m = (a.attribs?.href ?? '').match(LOT_LINK);
+    if (!m) continue;
+    const list = byId.get(m[1]);
+    if (list) list.push(a);
+    else byId.set(m[1], [a]);
+  }
+  if (byId.size === 0) return [];
+
+  // Para cada nó: de qual lote ele é ancestral (null = de mais de um).
+  const owner = new Map<any, string | null>();
+  for (const [id, anchors] of byId) {
+    for (const a of anchors) {
+      let n = a.parent;
+      for (let d = 0; n && d < 14; d++, n = n.parent) {
+        const cur = owner.get(n);
+        if (cur === undefined) owner.set(n, id);
+        else if (cur !== id) owner.set(n, null);
+      }
+    }
+  }
+
+  const lots: RawLot[] = [];
+  let index = 0;
+  for (const [id, anchors] of byId) {
+    index++;
+    // Título: preferência por link dentro de título (h1-h6); senão o texto de link mais longo que não seja "Lot # 12".
+    let title = '';
+    let titleHref = '';
+    let best = 0;
+    for (const a of anchors) {
+      const t = sanitizeTitle(textOf(a));
+      if (t.length < 5 || /^lot\s*#/i.test(t)) continue;
+      const score = (inHeading(a) ? 1000 : 0) + t.length;
+      if (score > best) {
+        best = score;
+        title = t;
+        titleHref = a.attribs?.href ?? '';
+      }
+    }
+    if (!title) continue;
+
+    let box: any = anchors[0].parent;
+    while (box.parent && owner.get(box.parent) === id) box = box.parent;
+    const text = textOf(box);
+
+    const lotNumber = text.match(/lot\s*#\s*:?\s*([A-Za-z0-9-]+)/i)?.[1] ?? String(index);
+    if (lotNumber === '0' || lotNumber === '00' || NOISE_LOT.test(title)) continue;
+
+    // A descrição é o que vem depois do título e antes dos controles de lance.
+    const afterTitle = text.includes(title) ? text.slice(text.indexOf(title) + title.length) : text;
+    const description = afterTitle
+      .replace(/lot\s*#\s*:?\s*[A-Za-z0-9-]+/i, '')
+      .split(/(?:high bid|current bid|minimum bid|starting bid|bid now|place bid|watch this)/i)[0]
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 400);
+
+    lots.push({
+      lotNumber,
+      title,
+      currentBid: bidFromText(text),
+      directUrl: absolute(titleHref, pageUrl),
+      imageUrl: absolute(firstImage(box), pageUrl),
+      description,
+      platformLotId: id,
+    });
+    if (lots.length >= MAX_LOTS_PER_PAGE) break;
+  }
+  return lots;
+}
+
+export function parseLots(doc: Doc, pageUrl: string): RawLot[] {
+  const $ = load(doc);
   const lots: RawLot[] = [];
   const seen = new Set<string>();
   let nodes = $(CONTAINER_SELECTOR).toArray();
@@ -208,12 +336,13 @@ export function parseLots(html: string, pageUrl: string): RawLot[] {
     seen.add(key);
     lots.push(lot);
   }
+  if (lots.length === 0) return parseByLotLinks($, pageUrl);
   return lots;
 }
 
 /** Procura o link de próxima página: rel=next, paginação comum, ?page=N ou /page/N. */
-export function findNextPages(html: string, pageUrl: string): string[] {
-  const $ = cheerio.load(html);
+export function findNextPages(doc: Doc, pageUrl: string): string[] {
+  const $ = load(doc);
   const out = new Set<string>();
 
   const rel = $('a[rel="next"], link[rel="next"]').first().attr('href');
@@ -314,9 +443,14 @@ export async function crawlStep(opts: {
       warnings.push(`Could not read ${url}: ${e instanceof Error ? e.message : 'unknown error'}`);
       continue;
     }
-    const found = parseLots(html, url);
+    const $doc = cheerio.load(html);
+    const found = parseLots($doc, url);
+    if (found.length === 0 && state.pages === 1) {
+      const t = html.match(/<title[^>]*>([^<]*)/i)?.[1]?.replace(/\s+/g, ' ').trim().slice(0, 80) ?? '';
+      warnings.push(`Read the page (${Math.round(html.length / 1024)} KB${t ? `, titled "${t}"` : ''}) but could not recognize any lots in it.`);
+    }
     lots.push(...found);
-    const nexts = findNextPages(html, url);
+    const nexts = findNextPages($doc, url);
     if (nexts.length === 0 && found.length > 0) {
       const probe = probeNext(url);
       if (probe) nexts.push(probe);
