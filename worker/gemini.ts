@@ -12,7 +12,9 @@ import { sellSpeedFromDays } from '../src/lib/pricing';
  * Separar as duas evita os problemas relatados ao combinar busca com saída estruturada na mesma chamada.
  */
 
-export const DEFAULT_MODEL = 'gemini-3.5-flash';
+export const DEFAULT_MODEL = 'gemini-3.8-flash';
+/** Se o modelo principal estiver indisponível (erro 5xx), tentamos estes em ordem. */
+export const FALLBACK_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash-lite'];
 export const MAX_ENRICH_LOTS = 8;
 
 const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -46,6 +48,17 @@ interface CallOptions {
   maxOutputTokens?: number;
 }
 
+/** Extrai do corpo do erro do Google a mensagem curta (ex.: qual cota estourou), sem dados sensíveis. */
+function googleDetail(body: string): string {
+  let msg = '';
+  try {
+    msg = String((JSON.parse(body) as { error?: { message?: string } })?.error?.message ?? '');
+  } catch {
+    msg = body;
+  }
+  return msg.replace(/\s+/g, ' ').trim().slice(0, 220);
+}
+
 function friendly(status: number, body: string, model: string): GeminiError {
   const lower = body.toLowerCase();
   if (status === 400 && (lower.includes('api key not valid') || lower.includes('api_key_invalid'))) {
@@ -66,10 +79,20 @@ function friendly(status: number, body: string, model: string): GeminiError {
     );
   }
   if (status === 429) {
-    return new GeminiError('Gemini rate limit reached. Wait a minute and try again.', 429, 'rate_limit');
+    const detail = googleDetail(body);
+    const suffix = detail ? ` (${detail})` : '';
+    // Cota diária esgotada: esperar um minuto não resolve, então usamos outro código.
+    if (/per\s?day|perday|daily|\bRPD\b/i.test(body)) {
+      return new GeminiError(
+        `Gemini's daily free quota is used up${suffix}. It resets once a day, or you can turn on billing in Google AI Studio.`,
+        429,
+        'quota',
+      );
+    }
+    return new GeminiError(`Gemini rate limit reached${suffix}. Wait a minute and try again.`, 429, 'rate_limit');
   }
   if (status >= 500) {
-    return new GeminiError('Gemini is temporarily unavailable. Try again in a moment.', 503, 'unavailable');
+    return new GeminiError(`Gemini is temporarily unavailable (HTTP ${status}, model ${model}). Try again in a moment.`, 503, 'unavailable');
   }
   return new GeminiError(`Gemini returned an error (HTTP ${status}).`, 502, 'gemini_error');
 }
@@ -77,7 +100,23 @@ function friendly(status: number, body: string, model: string): GeminiError {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function callGemini(cfg: GeminiConfig, o: CallOptions, fetchImpl: typeof fetch = fetch): Promise<string> {
-  const model = cfg.model || DEFAULT_MODEL;
+  const primary = cfg.model || DEFAULT_MODEL;
+  const chain = [primary, ...FALLBACK_MODELS.filter((m) => m !== primary)];
+  let last: unknown;
+  for (let i = 0; i < chain.length; i++) {
+    try {
+      return await callModel(cfg, chain[i], o, fetchImpl);
+    } catch (e) {
+      last = e;
+      // Cai para o próximo modelo quando o atual está fora do ar ou sem cota (no plano gratuito a cota é por modelo).
+      // Chave inválida, resposta bloqueada etc. não adiantam trocar.
+      if (!(e instanceof GeminiError) || !['unavailable', 'rate_limit', 'quota'].includes(e.code)) throw e;
+    }
+  }
+  throw last;
+}
+
+async function callModel(cfg: GeminiConfig, model: string, o: CallOptions, fetchImpl: typeof fetch): Promise<string> {
   const body: Record<string, unknown> = {
     contents: [{ role: 'user', parts: o.parts }],
     generationConfig: {
@@ -260,10 +299,15 @@ function lotBlock(raws: RawLot[]): string {
     .join('\n');
 }
 
-export function researchPrompt(raws: RawLot[]): string {
+export function researchPrompt(raws: RawLot[], withSearch = true): string {
+  const how = withSearch
+    ? 'Use web search to find RECENT SOLD prices (eBay sold listings first, then other marketplaces). '
+    : 'Web search is not available right now. Estimate typical resale prices from your own knowledge. Do NOT cite ' +
+      'specific sold listings you cannot vouch for: leave the sold-price examples empty if unsure. ';
   return (
-    'Research the resale market for each auction lot below. Use web search to find RECENT SOLD prices ' +
-    '(eBay sold listings first, then other marketplaces). For each lot, report in plain text:\n' +
+    'Research the resale market for each auction lot below. ' +
+    how +
+    'For each lot, report in plain text:\n' +
     '- the exact make, model and category;\n' +
     '- how many units the lot contains and the weight of the whole lot in pounds;\n' +
     '- 3 to 5 recent sold prices per unit (title, price, date, source);\n' +
@@ -412,11 +456,27 @@ export async function analyzeLots(
   }
   if (batch.length === 0) return { lots: [], warnings };
 
-  const research = await callGemini(
-    cfg,
-    { parts: [{ text: researchPrompt(batch) }], system: SYSTEM, search: true, temperature: 0.3, maxOutputTokens: 8192 },
-    fetchImpl,
-  );
+  let searched = true;
+  let research: string;
+  try {
+    research = await callGemini(
+      cfg,
+      { parts: [{ text: researchPrompt(batch) }], system: SYSTEM, search: true, temperature: 0.3, maxOutputTokens: 8192 },
+      fetchImpl,
+    );
+  } catch (e) {
+    // A busca na web tem cota própria e costuma ser a primeira a acabar. Sem ela ainda dá para estimar, com confiança baixa.
+    if (!(e instanceof GeminiError) || !['rate_limit', 'quota'].includes(e.code)) throw e;
+    searched = false;
+    research = await callGemini(
+      cfg,
+      { parts: [{ text: researchPrompt(batch, false) }], system: SYSTEM, temperature: 0.3, maxOutputTokens: 8192 },
+      fetchImpl,
+    );
+    warnings.push(
+      'Live web search was not available (Gemini search limit), so these prices are estimates from the AI\'s own knowledge with low confidence. Run the scan again later for prices from real sold listings.',
+    );
+  }
 
   const structured = await callGemini(
     cfg,
@@ -445,6 +505,10 @@ export async function analyzeLots(
       continue;
     }
     done.add(idx);
+    if (!searched) {
+      // Sem busca não há comparáveis verificáveis: nada de comps e confiança baixa.
+      lot.market = { ...lot.market, comps: [], confidence: Math.min(lot.market.confidence, 0.4) };
+    }
     lots.push(lot);
   }
   for (let i = 0; i < batch.length; i++) {
