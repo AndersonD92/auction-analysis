@@ -193,12 +193,14 @@ export function makeFetchJson(): FetchJson {
     try {
       const res = await fetch(u.toString(), {
         signal: ctrl.signal,
-        redirect: 'error',
+        // O Workers não aceita redirect: 'error'. Com 'manual' recebemos o 3xx e recusamos nós mesmos.
+        redirect: 'manual',
         headers: {
           'user-agent': 'Mozilla/5.0 (compatible; AuctionAnalysis/1.0)',
           accept: 'application/json',
         },
       });
+      if (res.status >= 300 && res.status < 400) throw new Error('The auction service redirected the request');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = await res.arrayBuffer();
       if (buf.byteLength > MAX_BYTES) throw new Error('Response is too large');
