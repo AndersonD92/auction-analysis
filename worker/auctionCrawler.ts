@@ -1,5 +1,7 @@
 import * as cheerio from 'cheerio/slim';
 import type { RawLot } from '../src/types';
+import { makeFetchJson, nextlotTarget, readNextlotPage } from './nextlot';
+import type { FetchJson } from './nextlot';
 
 /**
  * Leitura de catálogos de leilão por HTML. Roda dentro do Worker.
@@ -412,6 +414,8 @@ export async function crawlStep(opts: {
   pagesThisCall: number;
   maxPages: number;
   allowPrivate?: boolean;
+  /** Leitor de JSON usado pelos sites NextLot. Os testes trocam por um falso. */
+  fetchJson?: FetchJson;
 }): Promise<CrawlStepResult> {
   const { fetchHtml, maxPages, pagesThisCall, startUrl } = opts;
   const allowPrivate = opts.allowPrivate ?? false;
@@ -436,6 +440,26 @@ export async function crawlStep(opts: {
     state.visited.push(url);
     state.pages++;
     thisCall++;
+
+    // Sites NextLot (ex.: bidfischer.com) carregam os lotes por uma API; o HTML vem vazio.
+    const nl = nextlotTarget(url);
+    if (nl) {
+      try {
+        const r = await readNextlotPage(nl, nl.page, opts.fetchJson ?? makeFetchJson());
+        lots.push(...r.lots);
+        if (state.pages === 1 && r.totalCount > 0) {
+          warnings.push(`This auction has ${r.totalCount} lots in total.`);
+        }
+        if (r.nextPageUrl) {
+          const n = normalize(r.nextPageUrl);
+          if (!visited.has(n) && !state.queue.includes(n)) state.queue.push(n);
+        }
+      } catch (e) {
+        warnings.push(`Could not read ${url}: ${e instanceof Error ? e.message : 'unknown error'}`);
+      }
+      continue;
+    }
+
     let html: string;
     try {
       html = await fetchHtml(url);
