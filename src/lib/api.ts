@@ -11,6 +11,8 @@ export const isMockMode = import.meta.env.VITE_USE_MOCK === 'true';
 
 export const MAX_PAGES = 10;
 export const ENRICH_CHUNK = 6;
+/** Máximo de lotes analisados por scan. Catálogos grandes (900+ lotes) estourariam a cota da IA. */
+export const MAX_ANALYZED_LOTS = 150;
 
 export class ApiError extends Error {
   constructor(
@@ -128,67 +130,119 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** Espera entre pedaços para não estourar o limite por minuto da chave gratuita do Gemini. */
-export const ENRICH_PAUSE_MS = 4000;
+/** Quantos pedaços de lotes a IA analisa ao mesmo tempo. Cai para 1 sozinho se o Gemini pedir pausa. */
+export const ENRICH_CONCURRENCY = 3;
+/** Intervalo entre a partida de cada pedido paralelo, para não bater todos no mesmo instante. */
+export const ENRICH_STAGGER_MS = 1500;
 /** Esperas (em segundos) antes de tentar de novo um pedaço que bateu no limite do Gemini. */
 export const RATE_LIMIT_WAITS_S = [25, 45, 65];
 
-/** Analisa lotes brutos com a IA, em pedaços pequenos para caber no tempo do plano gratuito. */
+const FATAL_CODES = ['no_key', 'bad_key', 'bad_model', 'aborted'];
+
+/**
+ * Analisa lotes brutos com a IA, em pedaços pequenos para caber no tempo do plano gratuito.
+ * Vários pedaços rodam ao mesmo tempo (ENRICH_CONCURRENCY). Se o Gemini pedir pausa, passa a rodar um por vez.
+ */
 export async function enrichRaw(
   raws: RawLot[],
   ctx: { catalogUrl: string; name: string },
   onProgress?: (p: ScanProgress) => void,
   signal?: AbortSignal,
 ): Promise<{ lots: Lot[]; warnings: string[] }> {
-  const lots: Lot[] = [];
-  const warnings: string[] = [];
   const parts = chunk(raws, ENRICH_CHUNK);
   const scanId = `s${Date.now().toString(36)}`;
-  outer: for (let i = 0; i < parts.length; i++) {
-    const doneBefore = i * ENRICH_CHUNK;
-    const label = `Researching market prices (${Math.min(raws.length, doneBefore + parts[i].length)} of ${raws.length})`;
-    if (i > 0) await sleep(ENRICH_PAUSE_MS, signal);
+  // Resultado guardado por pedaço, para a lista final sair na ordem do catálogo.
+  const results: Lot[][] = parts.map(() => []);
+  const partWarnings: string[][] = parts.map(() => []);
+  const extra: string[] = [];
 
+  let allowed = ENRICH_CONCURRENCY;
+  let active = 0;
+  let next = 0;
+  let stop = false;
+  let fatal: unknown;
+  let finishedLots = 0;
+
+  const report = (message?: string) =>
+    onProgress?.({
+      stage: 'analyzing',
+      done: finishedLots,
+      total: raws.length,
+      message: message ?? `Researching market prices (${finishedLots} of ${raws.length})`,
+    });
+
+  async function runChunk(i: number): Promise<void> {
     let attempt = 0;
     for (;;) {
-      onProgress?.({ stage: 'analyzing', done: doneBefore, total: raws.length, message: label });
+      if (stop) return;
       try {
         const r = await post<{ lots: Lot[]; warnings: string[] }>(
           '/api/enrich',
           { lots: parts[i], catalogUrl: ctx.catalogUrl, auctionName: ctx.name },
           signal,
         );
-        lots.push(...finalizeLots(r.lots, ctx.catalogUrl, scanId, ctx.name));
-        warnings.push(...r.warnings);
-        break;
+        results[i] = finalizeLots(r.lots, ctx.catalogUrl, scanId, ctx.name);
+        partWarnings[i] = r.warnings;
+        return;
       } catch (e) {
-        // Se a IA não está configurada ou a chave é inválida não adianta tentar os próximos pedaços.
-        if (e instanceof ApiError && ['no_key', 'bad_key', 'bad_model', 'aborted'].includes(e.code)) throw e;
-        // Cota diária esgotada: os próximos pedaços falhariam igual. Para aqui e guarda o que já foi feito.
+        // IA desligada, chave inválida ou scan cancelado: não adianta continuar.
+        if (e instanceof ApiError && FATAL_CODES.includes(e.code)) throw e;
+        // Cota diária esgotada: os outros pedaços falhariam igual. Para tudo e guarda o que já foi feito.
         if (e instanceof ApiError && e.code === 'quota') {
-          warnings.push(e.message);
-          break outer;
+          extra.push(e.message);
+          stop = true;
+          return;
         }
-        // Limite por minuto do Gemini: espera e tenta o mesmo pedaço de novo.
+        // Limite por minuto: passa a rodar um pedaço por vez, espera e tenta o mesmo pedaço de novo.
         if (e instanceof ApiError && e.code === 'rate_limit' && attempt < RATE_LIMIT_WAITS_S.length) {
+          allowed = 1;
           const wait = RATE_LIMIT_WAITS_S[attempt];
           attempt += 1;
           for (let s = wait; s > 0; s--) {
-            onProgress?.({
-              stage: 'analyzing',
-              done: doneBefore,
-              total: raws.length,
-              message: `Gemini asked for a short pause. Trying again in ${s}s (attempt ${attempt} of ${RATE_LIMIT_WAITS_S.length})`,
-            });
+            report(`Gemini asked for a short pause. Trying again in ${s}s (attempt ${attempt} of ${RATE_LIMIT_WAITS_S.length})`);
             await sleep(1000, signal);
           }
           continue;
         }
-        warnings.push(`Lots ${parts[i][0].lotNumber}–${parts[i][parts[i].length - 1].lotNumber} failed: ${e instanceof Error ? e.message : 'unknown error'}`);
-        break;
+        partWarnings[i] = [`Lots ${parts[i][0].lotNumber}–${parts[i][parts[i].length - 1].lotNumber} failed: ${e instanceof Error ? e.message : 'unknown error'}`];
+        return;
       }
     }
   }
+
+  async function worker(index: number): Promise<void> {
+    try {
+      if (index > 0) await sleep(index * ENRICH_STAGGER_MS, signal);
+      for (;;) {
+        if (stop) return;
+        if (active >= allowed) {
+          await sleep(300, signal);
+          continue;
+        }
+        if (next >= parts.length) return;
+        const i = next++;
+        active++;
+        try {
+          report();
+          await runChunk(i);
+          finishedLots += parts[i].length;
+          report();
+        } finally {
+          active--;
+        }
+      }
+    } catch (e) {
+      fatal = fatal ?? e;
+      stop = true;
+    }
+  }
+
+  report();
+  await Promise.all(Array.from({ length: Math.min(ENRICH_CONCURRENCY, parts.length) }, (_, k) => worker(k)));
+  if (fatal) throw fatal;
+
+  const lots = results.flat();
+  const warnings = [...partWarnings.flat(), ...extra];
   if (lots.length === 0 && raws.length > 0) {
     throw new ApiError(warnings[0] ?? 'The AI could not analyze any lot.', 'no_result');
   }
@@ -235,7 +289,7 @@ export async function scanSource(
       raws.push(...r.lots);
       warnings.push(...r.warnings);
       state = r.state;
-      if (r.done) break;
+      if (r.done || raws.length >= MAX_ANALYZED_LOTS) break;
     }
     if (raws.length === 0) {
       const why = warnings.length ? ` Details: ${warnings.slice(0, 2).join(' ')}` : '';
@@ -273,6 +327,11 @@ export async function scanSource(
     seen.add(k);
     return true;
   });
+
+  if (raws.length > MAX_ANALYZED_LOTS) {
+    warnings.push(`Found ${raws.length} lots. Only the first ${MAX_ANALYZED_LOTS} were analyzed to keep the AI within its limits.`);
+    raws = raws.slice(0, MAX_ANALYZED_LOTS);
+  }
 
   const e = await enrichRaw(raws, { catalogUrl, name }, onProgress, signal);
   return { name, catalogUrl, lots: e.lots, warnings: [...warnings, ...e.warnings] };
